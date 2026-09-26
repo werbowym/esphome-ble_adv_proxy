@@ -60,6 +60,8 @@ class BleAdvProxy : public Component,
   // Static filters from YAML: applied in the scan handler, before any copy / lock / HA forwarding
   void add_static_ignored_cid(uint16_t cid) { this->static_ign_cids_.push_back(cid); }
   void add_static_ignored_mac(const std::string &mac);
+  // Traffic report period in ms (0 disables the report)
+  void set_stats_interval(uint32_t interval_ms) { this->stats_interval_ms_ = interval_ms; }
   void set_sensor_name(text_sensor::TextSensor *sens, const std::string &adapter_name) {
     this->sensor_name_ = sens;
     this->sensor_name_->state = adapter_name;
@@ -111,6 +113,27 @@ class BleAdvProxy : public Component,
   std::vector<std::array<uint8_t, ESP_BD_ADDR_LEN>> static_ign_macs_;
   std::atomic<uint32_t> static_ignored_count_{0};
   uint32_t last_filter_log_ = 0;
+
+  /**
+    Traffic stats (all updated from loop() context, except static_ignored_count_)
+   */
+  struct FwdSource {
+    std::array<uint8_t, ESP_BD_ADDR_LEN> mac;  // last MAC seen for this source
+    std::array<uint8_t, 6> head;               // first payload bytes, to identify sources without mfr data
+    uint8_t head_len;
+    uint16_t cid;
+    bool has_cid;
+    uint32_t count;
+  };
+  static constexpr size_t STATS_MAX_SOURCES = 16;
+  void record_forwarded_(const BleAdvParam &param);
+  void report_stats_();
+  uint32_t stats_interval_ms_ = 60000;
+  uint32_t stats_forwarded_ = 0;
+  uint32_t stats_ha_ignored_ = 0;
+  uint32_t stats_dupes_ = 0;
+  uint32_t stats_untracked_ = 0;  // forwarded from sources beyond STATS_MAX_SOURCES
+  std::vector<FwdSource> fwd_sources_;
 
   /*
   API Discovery

@@ -62,6 +62,8 @@ CONF_ADAPTER_NAME = "adapter_name"
 # Static filters: dropped on the ESP32 as soon as they are scanned, never forwarded to HA
 CONF_IGNORED_CIDS = "ignored_cids"
 CONF_IGNORED_MACS = "ignored_macs"
+# Periodic INFO traffic report (forwarded / filtered / dupes + top senders); 0s disables it
+CONF_STATS_INTERVAL = "stats_interval"
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
@@ -76,6 +78,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_IGNORED_MACS, default=[]): cv.ensure_list(
                 cv.mac_address
             ),
+            cv.Optional(
+                CONF_STATS_INTERVAL, default="60s"
+            ): cv.positive_time_period_milliseconds,
             cv.Optional(
                 CONF_NAME_SENSOR,
                 default={
@@ -100,6 +105,7 @@ async def to_code(config):
         cg.add(var.add_static_ignored_cid(cid))
     for mac in config[CONF_IGNORED_MACS]:
         cg.add(var.add_static_ignored_mac(str(mac)))
+    cg.add(var.set_stats_interval(config[CONF_STATS_INTERVAL]))
     parent = await cg.get_variable(config[CONF_BLE_ID])
     register_gap_scan_event_handler(parent, var)
     cg.add(var.set_parent(parent))

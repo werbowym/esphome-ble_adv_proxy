@@ -40,7 +40,24 @@ static constexpr const uint8_t REPEAT_NB = 3;
 static constexpr const uint8_t MIN_ADV = 0x20;
 static constexpr const uint8_t MIN_VIABLE_PACKET_LEN = 5;
 static constexpr const uint8_t AD_TYPE_MANUFACTURER_DATA = 0xFF;
-static constexpr const uint32_t FILTER_LOG_INTERVAL_MS = 60000;
+static constexpr const size_t STATS_TOP_N = 5;
+
+// Company ID of the first Manufacturer Specific Data AD structure, if any
+static bool first_mfr_cid(const uint8_t *buf, size_t end, uint16_t &cid) {
+  size_t pos = 0;
+  while (pos + 1 < end) {
+    const uint8_t len = buf[pos];
+    if (len == 0 || pos + 1 + len > end) {
+      return false;
+    }
+    if (buf[pos + 1] == AD_TYPE_MANUFACTURER_DATA && len >= 3) {
+      cid = uint16_t(buf[pos + 2]) | (uint16_t(buf[pos + 3]) << 8);
+      return true;
+    }
+    pos += 1 + len;
+  }
+  return false;
+}
 
 BleAdvParam::BleAdvParam(const std::string &hex_string, uint32_t duration)
     : duration_(duration), len_(std::min(MAX_PACKET_LEN, hex_string.size() / 2)) {
@@ -59,6 +76,7 @@ void BleAdvProxy::setup() {
   this->register_service(&BleAdvProxy::on_advertise_v1, ADV_SVC_V1,
                          {CONF_RAW, CONF_DURATION, CONF_REPEAT, CONF_IGN_ADVS, CONF_IGN_DURATION});
   this->scan_result_lock_ = xSemaphoreCreateMutex();
+  this->fwd_sources_.reserve(STATS_MAX_SOURCES);  // no reallocation in the hot path
   if (this->sensor_name_->state.empty()) {
     this->sensor_name_->state = App.get_name();
   }
@@ -73,6 +91,7 @@ void BleAdvProxy::dump_config() {
   for (auto cid : this->static_ign_cids_) {
     ESP_LOGCONFIG(TAG, "    Ignored CID: 0x%04X", cid);
   }
+  ESP_LOGCONFIG(TAG, "  Stats interval: %ums", (unsigned) this->stats_interval_ms_);
 }
 
 void BleAdvProxy::add_static_ignored_mac(const std::string &mac) {
@@ -180,7 +199,71 @@ void BleAdvProxy::on_raw_recv(const BleAdvParam &param, const std::string &str_m
     ESP_LOGD(TAG, "Connection to HA not ready, received adv ignored.");
     return;
   }
+  this->record_forwarded_(param);
   this->fire_homeassistant_event(ADV_RECV_EVENT, {{CONF_RAW, std::move(raw)}, {CONF_ORIGIN, std::move(str_mac)}});
+}
+
+// Group forwarded packets by company ID when present (phones rotate MACs), else by MAC
+void BleAdvProxy::record_forwarded_(const BleAdvParam &param) {
+  this->stats_forwarded_++;
+  if (this->stats_interval_ms_ == 0) {
+    return;
+  }
+  uint16_t cid = 0;
+  const bool has_cid = first_mfr_cid(param.buf_, param.len_, cid);
+  for (auto &s : this->fwd_sources_) {
+    const bool same = has_cid ? (s.has_cid && s.cid == cid)
+                              : (!s.has_cid && std::equal(s.mac.begin(), s.mac.end(), param.orig_));
+    if (same) {
+      s.count++;
+      std::copy(param.orig_, param.orig_ + ESP_BD_ADDR_LEN, s.mac.begin());
+      return;
+    }
+  }
+  if (this->fwd_sources_.size() >= STATS_MAX_SOURCES) {
+    this->stats_untracked_++;
+    return;
+  }
+  FwdSource s{};
+  std::copy(param.orig_, param.orig_ + ESP_BD_ADDR_LEN, s.mac.begin());
+  s.head_len = uint8_t(std::min(s.head.size(), param.len_));
+  std::copy(param.buf_, param.buf_ + s.head_len, s.head.begin());
+  s.cid = cid;
+  s.has_cid = has_cid;
+  s.count = 1;
+  this->fwd_sources_.push_back(s);
+}
+
+void BleAdvProxy::report_stats_() {
+  const uint32_t static_dropped = this->static_ignored_count_.exchange(0, std::memory_order_relaxed);
+  ESP_LOGI(TAG, "Last %us: forwarded %u | static-filtered %u | HA-filtered %u | dupes %u",
+           (unsigned) (this->stats_interval_ms_ / 1000), (unsigned) this->stats_forwarded_, (unsigned) static_dropped,
+           (unsigned) this->stats_ha_ignored_, (unsigned) this->stats_dupes_);
+  if (!this->fwd_sources_.empty()) {
+    const size_t n = std::min(STATS_TOP_N, this->fwd_sources_.size());
+    std::partial_sort(this->fwd_sources_.begin(), this->fwd_sources_.begin() + n, this->fwd_sources_.end(),
+                      [](const FwdSource &a, const FwdSource &b) { return a.count > b.count; });
+    for (size_t i = 0; i < n; ++i) {
+      const FwdSource &s = this->fwd_sources_[i];
+      const std::string mac = get_str_mac(s.mac.data());
+      if (s.has_cid) {
+        ESP_LOGI(TAG, "  #%u cid=0x%04X x%u (last MAC %s)", (unsigned) (i + 1), s.cid, (unsigned) s.count,
+                 mac.c_str());
+      } else {
+        const std::string head = esphome::format_hex(s.head.data(), s.head_len);
+        ESP_LOGI(TAG, "  #%u MAC %s x%u (no mfr data, starts %s)", (unsigned) (i + 1), mac.c_str(),
+                 (unsigned) s.count, head.c_str());
+      }
+    }
+    if (this->stats_untracked_ > 0) {
+      ESP_LOGI(TAG, "  + %u from further sources", (unsigned) this->stats_untracked_);
+    }
+  }
+  this->stats_forwarded_ = 0;
+  this->stats_ha_ignored_ = 0;
+  this->stats_dupes_ = 0;
+  this->stats_untracked_ = 0;
+  this->fwd_sources_.clear();
 }
 
 void BleAdvProxy::setup_max_tx_power() {
@@ -217,15 +300,11 @@ void BleAdvProxy::loop() {
   // Cleanup expired packets
   this->dupe_packets_.remove_if([&](BleAdvParam &p) { return p.duration_ > 0 && p.duration_ < millis(); });
 
-  // Report static filter activity once per interval (visible at INFO log level)
+  // Periodic traffic report (visible at INFO log level)
   const uint32_t now = millis();
-  if (now - this->last_filter_log_ >= FILTER_LOG_INTERVAL_MS) {
+  if (this->stats_interval_ms_ > 0 && now - this->last_filter_log_ >= this->stats_interval_ms_) {
     this->last_filter_log_ = now;
-    const uint32_t dropped = this->static_ignored_count_.exchange(0, std::memory_order_relaxed);
-    if (dropped > 0) {
-      ESP_LOGI(TAG, "Static filter dropped %u packets in the last %us", (unsigned) dropped,
-               (unsigned) (FILTER_LOG_INTERVAL_MS / 1000));
-    }
+    this->report_stats_();
   }
 
   // swap packet list to further process it outside of the lock
@@ -245,12 +324,17 @@ void BleAdvProxy::loop() {
   for (auto &sr : new_packets) {
     uint16_t cid = (sr.ble_adv[3] << 8) + sr.ble_adv[2];
     std::string str_mac = get_str_mac(sr.bda);
-    if (std::find(this->ign_cids_.begin(), this->ign_cids_.end(), cid) == this->ign_cids_.end() &&
-        std::find(this->ign_macs_.begin(), this->ign_macs_.end(), str_mac) == this->ign_macs_.end() &&
-        this->check_add_dupe_packet(
-            BleAdvParam(sr.ble_adv, sr.adv_data_len, sr.bda, millis() + this->dupe_ignore_duration_))) {
-      this->on_raw_recv(this->dupe_packets_.back(), str_mac);
+    if (std::find(this->ign_cids_.begin(), this->ign_cids_.end(), cid) != this->ign_cids_.end() ||
+        std::find(this->ign_macs_.begin(), this->ign_macs_.end(), str_mac) != this->ign_macs_.end()) {
+      this->stats_ha_ignored_++;
+      continue;
     }
+    if (!this->check_add_dupe_packet(
+            BleAdvParam(sr.ble_adv, sr.adv_data_len, sr.bda, millis() + this->dupe_ignore_duration_))) {
+      this->stats_dupes_++;
+      continue;
+    }
+    this->on_raw_recv(this->dupe_packets_.back(), str_mac);
   }
 
   // Process advertising
