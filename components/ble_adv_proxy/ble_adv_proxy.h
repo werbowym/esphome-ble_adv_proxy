@@ -57,6 +57,9 @@ class BleAdvProxy : public Component,
 #endif
 
   void set_use_max_tx_power(bool use_max_tx_power) { this->use_max_tx_power_ = use_max_tx_power; }
+  // Fixed BLE advertising interval in ms for every repetition (0 = legacy: interval follows the command's
+  // repetition duration, giving ~1 copy per repetition)
+  void set_adv_interval(uint32_t interval_ms) { this->adv_interval_ms_ = interval_ms; }
   // Static filters from YAML: applied in the scan handler, before any copy / lock / HA forwarding
   void add_static_ignored_cid(uint16_t cid) { this->static_ign_cids_.push_back(cid); }
   void add_static_ignored_mac(const std::string &mac);
@@ -92,6 +95,7 @@ class BleAdvProxy : public Component,
   };
 
   bool use_max_tx_power_ = false;
+  uint32_t adv_interval_ms_ = 0;
   bool max_tx_power_setup_done_ = false;
   void setup_max_tx_power();
 

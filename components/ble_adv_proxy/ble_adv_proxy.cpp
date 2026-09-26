@@ -37,7 +37,8 @@ static constexpr const char *CONF_DURATION = "duration";
 static constexpr const char *CONF_REPEAT = "repeat";
 
 static constexpr const uint8_t REPEAT_NB = 3;
-static constexpr const uint8_t MIN_ADV = 0x20;
+static constexpr const uint32_t MIN_ADV = 0x20;    // 20ms, BLE minimum
+static constexpr const uint32_t MAX_ADV = 0x4000;  // 10.24s, BLE maximum
 static constexpr const uint8_t MIN_VIABLE_PACKET_LEN = 5;
 static constexpr const uint8_t AD_TYPE_MANUFACTURER_DATA = 0xFF;
 static constexpr const size_t STATS_TOP_N = 5;
@@ -86,6 +87,11 @@ void BleAdvProxy::setup() {
 void BleAdvProxy::dump_config() {
   ESP_LOGCONFIG(TAG, "BleAdvProxy '%s'", this->sensor_name_->state.c_str());
   ESP_LOGCONFIG(TAG, "  Use Max TxPower: %s", this->use_max_tx_power_ ? "True" : "False");
+  if (this->adv_interval_ms_ > 0) {
+    ESP_LOGCONFIG(TAG, "  Advertising interval: fixed %ums", (unsigned) this->adv_interval_ms_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Advertising interval: per command (legacy)");
+  }
   ESP_LOGCONFIG(TAG, "  Static filter: %u company IDs, %u MACs", (unsigned) this->static_ign_cids_.size(),
                 (unsigned) this->static_ign_macs_.size());
   for (auto cid : this->static_ign_cids_) {
@@ -344,7 +350,11 @@ void BleAdvProxy::loop() {
       BleAdvParam &packet = this->send_packets_.front();
       this->setup_max_tx_power();
       ESP_ERROR_CHECK_WITHOUT_ABORT(esp_ble_gap_config_adv_data_raw(packet.buf_, packet.len_));
-      uint8_t adv_time = std::max(MIN_ADV, uint8_t(1.6 * packet.duration_));
+      // BLE advertising interval unit is 0.625ms (x1.6 per ms). Fixed interval if configured, else legacy
+      // behaviour (interval ~= repetition duration, i.e. ~1 copy per repetition). Computed in 32 bits and
+      // clamped: the legacy uint8_t cast overflowed for durations above ~159ms.
+      const uint32_t req_ms = this->adv_interval_ms_ > 0 ? this->adv_interval_ms_ : packet.duration_;
+      const uint16_t adv_time = uint16_t(std::clamp<uint32_t>((req_ms * 16) / 10, MIN_ADV, MAX_ADV));
       this->adv_params_.adv_int_min = adv_time;
       this->adv_params_.adv_int_max = adv_time;
       ESP_ERROR_CHECK_WITHOUT_ABORT(esp_ble_gap_start_advertising(&(this->adv_params_)));

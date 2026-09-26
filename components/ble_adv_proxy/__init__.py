@@ -64,6 +64,9 @@ CONF_IGNORED_CIDS = "ignored_cids"
 CONF_IGNORED_MACS = "ignored_macs"
 # Periodic INFO traffic report (forwarded / filtered / dupes + top senders); 0s disables it
 CONF_STATS_INTERVAL = "stats_interval"
+# Fixed BLE advertising interval for every repetition of a command (20ms = fastest BLE allows).
+# Unset keeps upstream behaviour (interval follows the command's repetition duration).
+CONF_ADV_INTERVAL = "advertising_interval"
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
@@ -81,6 +84,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(
                 CONF_STATS_INTERVAL, default="60s"
             ): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_ADV_INTERVAL): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(milliseconds=20), max=cv.TimePeriod(milliseconds=10240)),
+            ),
             cv.Optional(
                 CONF_NAME_SENSOR,
                 default={
@@ -106,6 +113,8 @@ async def to_code(config):
     for mac in config[CONF_IGNORED_MACS]:
         cg.add(var.add_static_ignored_mac(str(mac)))
     cg.add(var.set_stats_interval(config[CONF_STATS_INTERVAL]))
+    if CONF_ADV_INTERVAL in config:
+        cg.add(var.set_adv_interval(config[CONF_ADV_INTERVAL]))
     parent = await cg.get_variable(config[CONF_BLE_ID])
     register_gap_scan_event_handler(parent, var)
     cg.add(var.set_parent(parent))
