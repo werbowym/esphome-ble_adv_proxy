@@ -8,6 +8,8 @@
 
 #include <freertos/semphr.h>
 #include <esp_gap_ble_api.h>
+#include <array>
+#include <atomic>
 #include <list>
 #include <vector>
 
@@ -55,6 +57,9 @@ class BleAdvProxy : public Component,
 #endif
 
   void set_use_max_tx_power(bool use_max_tx_power) { this->use_max_tx_power_ = use_max_tx_power; }
+  // Static filters from YAML: applied in the scan handler, before any copy / lock / HA forwarding
+  void add_static_ignored_cid(uint16_t cid) { this->static_ign_cids_.push_back(cid); }
+  void add_static_ignored_mac(const std::string &mac);
   void set_sensor_name(text_sensor::TextSensor *sens, const std::string &adapter_name) {
     this->sensor_name_ = sens;
     this->sensor_name_->state = adapter_name;
@@ -97,6 +102,15 @@ class BleAdvProxy : public Component,
   std::list<BleAdvParam> dupe_packets_;
   std::vector<std::string> ign_macs_;
   std::vector<uint16_t> ign_cids_;
+
+  /**
+    Static filtering (YAML), independent from the HA provided lists above
+   */
+  bool is_statically_ignored_(const esp32_ble::BLEScanResult &sr) const;
+  std::vector<uint16_t> static_ign_cids_;
+  std::vector<std::array<uint8_t, ESP_BD_ADDR_LEN>> static_ign_macs_;
+  std::atomic<uint32_t> static_ignored_count_{0};
+  uint32_t last_filter_log_ = 0;
 
   /*
   API Discovery

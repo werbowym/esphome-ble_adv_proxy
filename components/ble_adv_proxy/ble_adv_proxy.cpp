@@ -4,6 +4,8 @@
 #include <esp_err.h>
 #include <esp_bt.h>
 #include <esp_bt_device.h>
+#include <algorithm>
+#include <cstdio>
 
 #ifdef ESP_PWR_LVL_P20
 #define MAX_TX_POWER ESP_PWR_LVL_P20
@@ -37,6 +39,8 @@ static constexpr const char *CONF_REPEAT = "repeat";
 static constexpr const uint8_t REPEAT_NB = 3;
 static constexpr const uint8_t MIN_ADV = 0x20;
 static constexpr const uint8_t MIN_VIABLE_PACKET_LEN = 5;
+static constexpr const uint8_t AD_TYPE_MANUFACTURER_DATA = 0xFF;
+static constexpr const uint32_t FILTER_LOG_INTERVAL_MS = 60000;
 
 BleAdvParam::BleAdvParam(const std::string &hex_string, uint32_t duration)
     : duration_(duration), len_(std::min(MAX_PACKET_LEN, hex_string.size() / 2)) {
@@ -64,6 +68,54 @@ void BleAdvProxy::setup() {
 void BleAdvProxy::dump_config() {
   ESP_LOGCONFIG(TAG, "BleAdvProxy '%s'", this->sensor_name_->state.c_str());
   ESP_LOGCONFIG(TAG, "  Use Max TxPower: %s", this->use_max_tx_power_ ? "True" : "False");
+  ESP_LOGCONFIG(TAG, "  Static filter: %u company IDs, %u MACs", (unsigned) this->static_ign_cids_.size(),
+                (unsigned) this->static_ign_macs_.size());
+  for (auto cid : this->static_ign_cids_) {
+    ESP_LOGCONFIG(TAG, "    Ignored CID: 0x%04X", cid);
+  }
+}
+
+void BleAdvProxy::add_static_ignored_mac(const std::string &mac) {
+  unsigned int b[ESP_BD_ADDR_LEN];
+  if (sscanf(mac.c_str(), "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != ESP_BD_ADDR_LEN) {
+    ESP_LOGE(TAG, "Invalid MAC in ignored_macs: %s", mac.c_str());
+    return;
+  }
+  std::array<uint8_t, ESP_BD_ADDR_LEN> addr{};
+  for (size_t i = 0; i < ESP_BD_ADDR_LEN; ++i) {
+    addr[i] = uint8_t(b[i]);
+  }
+  this->static_ign_macs_.push_back(addr);
+}
+
+// Cheap check run on every scanned packet: MAC compare, then walk the AD structures
+// looking for Manufacturer Specific Data (0xFF) whose company ID is ignored.
+bool BleAdvProxy::is_statically_ignored_(const esp32_ble::BLEScanResult &sr) const {
+  for (const auto &mac : this->static_ign_macs_) {
+    if (std::equal(mac.begin(), mac.end(), sr.bda)) {
+      return true;
+    }
+  }
+  if (this->static_ign_cids_.empty()) {
+    return false;
+  }
+  const size_t end = sr.adv_data_len;
+  size_t pos = 0;
+  while (pos + 1 < end) {
+    const uint8_t len = sr.ble_adv[pos];  // length of [type + data]
+    if (len == 0 || pos + 1 + len > end) {
+      break;  // malformed / padding: stop parsing
+    }
+    if (sr.ble_adv[pos + 1] == AD_TYPE_MANUFACTURER_DATA && len >= 3) {
+      const uint16_t cid = uint16_t(sr.ble_adv[pos + 2]) | (uint16_t(sr.ble_adv[pos + 3]) << 8);
+      if (std::find(this->static_ign_cids_.begin(), this->static_ign_cids_.end(), cid) !=
+          this->static_ign_cids_.end()) {
+        return true;
+      }
+    }
+    pos += 1 + len;
+  }
+  return false;
 }
 
 void BleAdvProxy::on_setup_v0(float ign_duration, std::vector<float> ignored_cids,
@@ -165,6 +217,17 @@ void BleAdvProxy::loop() {
   // Cleanup expired packets
   this->dupe_packets_.remove_if([&](BleAdvParam &p) { return p.duration_ > 0 && p.duration_ < millis(); });
 
+  // Report static filter activity once per interval (visible at INFO log level)
+  const uint32_t now = millis();
+  if (now - this->last_filter_log_ >= FILTER_LOG_INTERVAL_MS) {
+    this->last_filter_log_ = now;
+    const uint32_t dropped = this->static_ignored_count_.exchange(0, std::memory_order_relaxed);
+    if (dropped > 0) {
+      ESP_LOGI(TAG, "Static filter dropped %u packets in the last %us", (unsigned) dropped,
+               (unsigned) (FILTER_LOG_INTERVAL_MS / 1000));
+    }
+  }
+
   // swap packet list to further process it outside of the lock
   std::list<esp32_ble::BLEScanResult> new_packets;
   if (xSemaphoreTake(this->scan_result_lock_, 5L / portTICK_PERIOD_MS)) {
@@ -217,6 +280,11 @@ void BleAdvProxy::loop() {
 // We only gather directly the raw events
 void BleAdvProxy::gap_scan_event_handler(const esp32_ble::BLEScanResult &sr) {
   if (sr.adv_data_len <= MAX_PACKET_LEN && sr.adv_data_len >= MIN_VIABLE_PACKET_LEN) {
+    // Drop statically ignored packets before any lock, copy or allocation
+    if (this->is_statically_ignored_(sr)) {
+      this->static_ignored_count_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
     if (xSemaphoreTake(this->scan_result_lock_, 5L / portTICK_PERIOD_MS)) {
       this->recv_packets_.emplace_back(sr);
       xSemaphoreGive(this->scan_result_lock_);

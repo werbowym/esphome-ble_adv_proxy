@@ -59,6 +59,9 @@ CONF_BLE_ADV_USE_MAX_TX_POWER = "use_max_tx_power"
 CONF_NAME_SENSOR = "name_sensor"
 CONF_VAL_NAME_SENSOR = "ble_adv_proxy_name"
 CONF_ADAPTER_NAME = "adapter_name"
+# Static filters: dropped on the ESP32 as soon as they are scanned, never forwarded to HA
+CONF_IGNORED_CIDS = "ignored_cids"
+CONF_IGNORED_MACS = "ignored_macs"
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
@@ -67,6 +70,12 @@ CONFIG_SCHEMA = cv.All(
             cv.GenerateID(CONF_BLE_ID): cv.use_id(ESP32BLE),
             cv.Optional(CONF_BLE_ADV_USE_MAX_TX_POWER, default=False): cv.boolean,
             cv.Optional(CONF_ADAPTER_NAME): cv.valid_name,
+            cv.Optional(CONF_IGNORED_CIDS, default=[]): cv.ensure_list(
+                cv.hex_uint16_t
+            ),
+            cv.Optional(CONF_IGNORED_MACS, default=[]): cv.ensure_list(
+                cv.mac_address
+            ),
             cv.Optional(
                 CONF_NAME_SENSOR,
                 default={
@@ -87,6 +96,10 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     cg.add(var.set_use_max_tx_power(config[CONF_BLE_ADV_USE_MAX_TX_POWER]))
+    for cid in config[CONF_IGNORED_CIDS]:
+        cg.add(var.add_static_ignored_cid(cid))
+    for mac in config[CONF_IGNORED_MACS]:
+        cg.add(var.add_static_ignored_mac(str(mac)))
     parent = await cg.get_variable(config[CONF_BLE_ID])
     register_gap_scan_event_handler(parent, var)
     cg.add(var.set_parent(parent))
